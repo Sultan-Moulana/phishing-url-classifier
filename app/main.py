@@ -2,7 +2,11 @@ import os
 import joblib
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from app.extractor import extract_url_features
+
+if __package__:
+    from .extractor import extract_url_features
+else:
+    from extractor import extract_url_features
 
 app = FastAPI(
     title="PhishGuard-ML API",
@@ -62,3 +66,9 @@ def classify_url(payload: URLPayload):
             spoof_or_typosquat_detected=bool(features[15]),
         )
     )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)
