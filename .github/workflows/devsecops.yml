@@ -53,6 +53,8 @@ jobs:
       # SCA: Filesystem / dependency scan
       - name: Run Trivy Filesystem & Dependency Scan (SCA)
         uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_DEBUG: "true"
         with:
           scan-type: "fs"
           scan-ref: "."
@@ -62,13 +64,6 @@ jobs:
           ignore-unfixed: true
           severity: "CRITICAL,HIGH"
 
-      - name: Upload Filesystem Scan Results to GitHub Security Tab
-        uses: github/codeql-action/upload-sarif@v4
-        if: always()
-        with:
-          sarif_file: "trivy-fs-results.sarif"
-          category: "trivy-fs"
-
       # Build
       - name: Build Hardened Docker Image
         run: docker build -t phishguard-ml:${{ github.sha }} .
@@ -76,6 +71,8 @@ jobs:
       # Image scan
       - name: Run Trivy Container Image Scan
         uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_DEBUG: "true"
         with:
           image-ref: "phishguard-ml:${{ github.sha }}"
           format: "sarif"
