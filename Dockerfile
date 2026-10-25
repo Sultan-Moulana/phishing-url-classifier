@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Patch OS-level Debian packages to pass AquaSec Trivy container scans
+# Patch OS-level Debian packages
 RUN apt-get update && apt-get upgrade -y && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -13,15 +13,18 @@ RUN apt-get update && apt-get upgrade -y && \
 RUN groupadd -r appgroup && useradd -r -g appgroup -d /app -s /sbin/nologin appuser
 
 COPY requirements.txt .
-# Upgrade core Python build tools to patch CVEs before installing requirements
+
+# Forcefully patch the core build tools (setuptools/wheel) to clear CVEs
 RUN pip install --no-cache-dir --upgrade pip setuptools>=78.1.1 wheel>=0.46.2 && \
     pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
 COPY train_model.py .
 
-# Train and serialize model during build, then enforce least-privilege ownership
-RUN python train_model.py && chown -R appuser:appgroup /app
+# Train and serialize model during build, clear cache, enforce ownership
+RUN python train_model.py && \
+    rm -rf data/ && \
+    chown -R appuser:appgroup /app
 
 USER appuser
 
