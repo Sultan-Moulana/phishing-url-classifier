@@ -16,7 +16,7 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir --force-reinstall \
+    pip install --no-cache-dir --force-reinstall --no-deps \
         "setuptools==78.1.1" \
         "msgpack==1.2.1" \
         "urllib3==2.8.0" \
