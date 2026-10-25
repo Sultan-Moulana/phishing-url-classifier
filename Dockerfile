@@ -13,7 +13,8 @@ RUN apt-get update && apt-get upgrade -y && \
 RUN groupadd -r appgroup && useradd -r -g appgroup -d /app -s /sbin/nologin appuser
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
+# Upgrade core Python build tools to patch CVEs before installing requirements
+RUN pip install --no-cache-dir --upgrade pip setuptools>=78.1.1 wheel>=0.46.2 && \
     pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
