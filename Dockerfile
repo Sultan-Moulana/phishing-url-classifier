@@ -17,11 +17,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir --force-reinstall --no-deps \
-        "setuptools==78.1.1" \
+        "setuptools==84.2.1" \
         "msgpack==1.2.1" \
         "urllib3==2.8.0" \
-        "wheel==0.46.2" \
-        "jaraco.context==6.1.0"
+        "wheel==0.48.0" \
+        "jaraco.context==6.1.2" && \
+    python -c "from importlib.metadata import version; expected = {'setuptools': '84.2.1', 'msgpack': '1.2.1', 'urllib3': '2.8.0', 'wheel': '0.48.0', 'jaraco.context': '6.1.2'}; actual = {name: version(name) for name in expected}; assert actual == expected, f'Unexpected security dependency versions: {actual}'"
 
 COPY app/ ./app/
 COPY train_model.py .
