@@ -14,10 +14,14 @@ RUN groupadd -r appgroup && useradd -r -g appgroup -d /app -s /sbin/nologin appu
 
 COPY requirements.txt .
 
-# Force-reinstall to wipe out the base image's vulnerable .dist-info folders
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir --force-reinstall setuptools==78.1.1 msgpack==1.2.1 urllib3==2.8.0 wheel==0.46.2 && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir --force-reinstall \
+        "setuptools==78.1.1" \
+        "msgpack==1.2.1" \
+        "urllib3==2.8.0" \
+        "wheel==0.46.2" \
+        "jaraco.context==6.1.0"
 
 COPY app/ ./app/
 COPY train_model.py .
