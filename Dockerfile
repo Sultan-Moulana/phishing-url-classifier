@@ -5,11 +5,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Upgrade OS packages to patch known CVEs before Trivy scan
+# Patch OS-level Debian packages to pass AquaSec Trivy container scans
 RUN apt-get update && apt-get upgrade -y && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user for security hardening
+# Create non-root execution user
 RUN groupadd -r appgroup && useradd -r -g appgroup -d /app -s /sbin/nologin appuser
 
 COPY requirements.txt .
@@ -19,10 +19,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY app/ ./app/
 COPY train_model.py .
 
-# Train model using live feeds, remove raw feed cache in the same layer, and set permissions
-RUN python train_model.py && \
-    rm -rf data/ && \
-    chown -R appuser:appgroup /app
+# Train and serialize model during build, then enforce least-privilege ownership
+RUN python train_model.py && chown -R appuser:appgroup /app
 
 USER appuser
 

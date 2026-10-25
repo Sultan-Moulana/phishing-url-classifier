@@ -1,497 +1,306 @@
-"""
-train_model.py — Phishing URL Classifier  (v4)
-------------------------------------------------
-Data strategy:
-  Phishing  → OpenPhish + mitchellkrogza/Phishing.Database  (live feeds)
-  Benign    → Tranco top-1M list (zip download, take top 3k domains)
-              + hardcoded Alexa/auth/OAuth domains as guaranteed floor
-  Class balance target: no worse than 5:1 phishing:benign
-"""
-
-import io
 import os
-import sys
-import zipfile
-import urllib.request
-from collections import Counter
-
+import random
 import joblib
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    roc_auc_score,
-)
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, VotingClassifier
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 
-from app.extractor import extract_url_features
+from app.extractor import FEATURE_NAMES, extract_url_features
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  Hardcoded benign domains  (guaranteed floor — used even if Tranco fails)
-# ─────────────────────────────────────────────────────────────────────────────
-_BENIGN_DOMAINS_HARDCODED = [
-    # Search / portals
-    "google.com", "bing.com", "yahoo.com", "duckduckgo.com", "baidu.com",
-    "yandex.com", "ask.com", "ecosia.org", "brave.com", "qwant.com",
-    # Social
-    "facebook.com", "twitter.com", "instagram.com", "linkedin.com",
-    "reddit.com", "pinterest.com", "tiktok.com", "snapchat.com",
-    "tumblr.com", "quora.com", "discord.com", "telegram.org",
-    "whatsapp.com", "signal.org", "mastodon.social", "threads.net",
-    # Video / media
-    "youtube.com", "netflix.com", "twitch.tv", "vimeo.com",
-    "hulu.com", "disneyplus.com", "primevideo.com", "crunchyroll.com",
-    "spotify.com", "soundcloud.com", "pandora.com", "apple.com",
-    "peacocktv.com", "paramountplus.com", "hbomax.com", "espn.com",
-    # E-commerce
-    "amazon.com", "ebay.com", "etsy.com", "walmart.com", "target.com",
-    "bestbuy.com", "newegg.com", "aliexpress.com", "shopify.com",
-    "costco.com", "homedepot.com", "lowes.com", "macys.com",
-    "wayfair.com", "chewy.com", "overstock.com", "zappos.com",
-    # Finance / banking
-    "chase.com", "bankofamerica.com", "wellsfargo.com", "citi.com",
-    "paypal.com", "venmo.com", "stripe.com", "intuit.com",
-    "fidelity.com", "schwab.com", "vanguard.com", "coinbase.com",
-    "capitalone.com", "usbank.com", "tdbank.com", "pnc.com",
-    "ally.com", "discover.com", "americanexpress.com", "mastercard.com",
-    "visa.com", "transferwise.com", "wise.com", "revolut.com",
-    # Tech
-    "microsoft.com", "github.com", "stackoverflow.com", "gitlab.com",
-    "cloudflare.com", "digitalocean.com", "heroku.com", "vercel.com",
-    "npmjs.com", "pypi.org", "docker.com", "kubernetes.io",
-    "mozilla.org", "opera.com", "adobe.com", "oracle.com",
-    "salesforce.com", "servicenow.com", "workday.com", "sap.com",
-    # Cloud
-    "aws.amazon.com", "cloud.google.com", "azure.microsoft.com",
-    # Developer
-    "developer.mozilla.org", "docs.python.org", "docs.github.com",
-    "readthedocs.io", "devdocs.io", "npmjs.com", "hub.docker.com",
-    # News
-    "nytimes.com", "bbc.com", "cnn.com", "theguardian.com",
-    "reuters.com", "apnews.com", "bloomberg.com", "wsj.com",
-    "washingtonpost.com", "usatoday.com", "forbes.com", "time.com",
-    "techcrunch.com", "theverge.com", "wired.com", "ars technica.com",
-    "arstechnica.com", "zdnet.com", "cnet.com", "engadget.com",
-    # Gov / edu
-    "usa.gov", "irs.gov", "ssa.gov", "cdc.gov", "fda.gov",
-    "nasa.gov", "nist.gov", "mit.edu", "stanford.edu", "harvard.edu",
-    "berkeley.edu", "ox.ac.uk", "cam.ac.uk", "yale.edu", "columbia.edu",
-    # Reference
-    "wikipedia.org", "britannica.com", "wolframalpha.com",
-    "scholar.google.com", "pubmed.ncbi.nlm.nih.gov", "arxiv.org",
-    # Security
-    "owasp.org", "cve.mitre.org", "nvd.nist.gov", "shodan.io",
-    "virustotal.com", "haveibeenpwned.com", "malwarebytes.com",
-    "crowdstrike.com", "paloaltonetworks.com", "cisco.com",
-    # SaaS / collaboration
-    "office.com", "notion.so", "atlassian.com", "slack.com",
-    "zoom.us", "webex.com", "dropbox.com", "box.com",
-    "trello.com", "asana.com", "monday.com", "clickup.com",
-    "figma.com", "canva.com", "miro.com", "airtable.com",
-    # Auth / SSO  ← look "suspicious" but are totally benign
-    "login.microsoftonline.com", "accounts.google.com",
-    "signin.aws.amazon.com", "auth.atlassian.com",
-    "id.apple.com", "account.live.com", "my.yahoo.com",
-    "auth0.com", "okta.com", "onelogin.com", "ping.com",
-    "identity.apple.com", "appleid.apple.com",
-    "myaccount.google.com", "security.google.com",
-    # E-mail
-    "mail.google.com", "outlook.live.com", "mail.yahoo.com",
-    "proton.me", "fastmail.com", "zoho.com", "tutanota.com",
+SEED = 42
+
+LEGIT_DOMAINS = [
+    "google.com", "github.com", "microsoft.com", "apple.com", "amazon.com",
+    "wikipedia.org", "stackoverflow.com", "linkedin.com", "reddit.com", "youtube.com",
+    "netflix.com", "nytimes.com", "bbc.co.uk", "theguardian.com", "reuters.com",
+    "cloudflare.com", "digitalocean.com", "docker.com", "kubernetes.io", "python.org",
+    "pypi.org", "npmjs.com", "mozilla.org", "ubuntu.com", "debian.org",
+    "mit.edu", "stanford.edu", "harvard.edu", "ox.ac.uk", "cam.ac.uk",
+    "chase.com", "bankofamerica.com", "wellsfargo.com", "paypal.com", "stripe.com",
+    "coinbase.com", "wise.com", "revolut.com", "fidelity.com", "vanguard.com",
+    "atlassian.com", "slack.com", "notion.so", "figma.com", "canva.com",
+    "dropbox.com", "zoom.us", "salesforce.com", "oracle.com", "adobe.com",
+    "spotify.com", "twitch.tv", "discord.com", "steampowered.com", "epicgames.com",
+    "walmart.com", "target.com", "bestbuy.com", "ebay.com", "etsy.com",
+    "shopify.com", "ikea.com", "booking.com", "airbnb.com", "expedia.com",
+    "nasa.gov", "nist.gov", "cdc.gov", "who.int", "arxiv.org",
+]
+
+LEGIT_SUBDOMAINS = [
+    "docs", "developer", "api", "support", "help", "blog", "news",
+    "status", "community", "learn", "portal", "console", "cloud", "mail"
+]
+
+LEGIT_PATHS = [
+    "/",
+    "/about",
+    "/pricing",
+    "/contact-us",
+    "/docs/getting-started/installation",
+    "/docs/api/v2/reference/authentication",
+    "/blog/2026/10/securing-modern-container-pipelines",
+    "/articles/machine-learning-best-practices-production",
+    "/products/electronics/wireless-noise-canceling-headphones-xm5",
+    "/questions/11227809/why-is-processing-a-sorted-array-faster",
+    "/repos/torvalds/linux/commits/master",
+    "/search?q=devsecops+ci+cd+pipeline&page=2&sort=relevance",
+    "/watch?v=dQw4w9WgXcQ&ab_channel=OfficialArtist",
+    "/user/profile/settings/notifications",
+    "/courses/cybersecurity-fundamentals/modules/network-defense",
+    "/en-us/windows/security/threat-protection/overview",
+    "/release-notes/v4.12.0/changelog.html",
+]
+
+LEGIT_AUTH_URLS = [
+    "https://accounts.google.com/ServiceLogin?hl=en&passive=true&continue=https://www.google.com/",
+    "https://accounts.google.com/o/oauth2/v2/auth?client_id=48192.apps.googleusercontent.com&response_type=code&scope=openid%20email",
+    "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=9a8b7c&response_type=code&redirect_uri=https://portal.azure.com",
+    "https://github.com/login/oauth/authorize?client_id=Iv1.8a7b6c5d4e&scope=read:user",
+    "https://github.com/login?return_to=%2Ftorvalds%2Flinux",
+    "https://signin.aws.amazon.com/signin?redirect_uri=https%3A%2F%2Fconsole.aws.amazon.com",
+    "https://id.apple.com/auth/authorize?client_id=com.apple.account",
+    "https://auth.atlassian.com/authorize?audience=api.atlassian.com&prompt=login",
+    "https://www.paypal.com/signin?returnUri=https%3A%2F%2Fwww.paypal.com%2Fmyaccount",
+    "https://www.linkedin.com/uas/login?session_redirect=https%3A%2F%2Fwww.linkedin.com%2Ffeed%2F",
+    "https://myaccount.google.com/security-checkup",
+    "https://store.steampowered.com/login/?redir=app%2F730",
+    "https://discord.com/login?redirect_to=%2Fchannels%2F%40me",
+    "https://www.dropbox.com/login?cont=https%3A%2F%2Fwww.dropbox.com%2Fhome",
+]
+
+PHISH_BRANDS = [
+    "paypal", "apple", "icloud", "google", "microsoft", "office365",
+    "amazon", "netflix", "chase", "wellsfargo", "bankofamerica",
+    "binance", "coinbase", "metamask", "steam", "steamcommunity",
+    "dhl", "fedex", "usps", "docusign", "linkedin", "instagram",
+    "facebook", "whatsapp", "dropbox", "adobe", "outlook", "revolut"
+]
+
+PHISH_WORDS = [
+    "secure", "login", "signin", "verify", "verification", "update",
+    "account", "billing", "confirm", "unlock", "alert", "support",
+    "auth", "portal", "recovery", "suspend", "validation", "security"
+]
+
+PHISH_TLDS = [
+    "com", "net", "org", "info", "biz", "xyz", "top", "club",
+    "tk", "ml", "ga", "cf", "gq", "work", "click", "link", "ru", "icu", "buzz"
+]
+
+LEET_DOMAINS = [
+    "paypa1.com", "paypa1-secure.com", "g00gle-accounts.com", "micr0s0ft-login.com",
+    "arnazon-prime.com", "netf1ix-billing.com", "netfl1x.com", "app1e-id-support.com",
+    "faceb00k-security.com", "linkedln-auth.com", "rnicrosoftonline.com",
+    "c0inbase-wallet.com", "b1nance-verify.com", "stearncornmunity.com",
+    "vvellsfargo-online.com", "instagrarn-help.com", "disccrd-nitro.com"
+]
+
+COMPROMISED_DOMAINS = [
+    "green-valley-dentistry.com", "bella-italia-bistro.org", "midwest-plumbing-supply.net",
+    "sunnyvale-youth-soccer.org", "heritage-woodworking-shop.com", "metro-auto-repair.net",
+    "old-town-bakery-cafe.com", "pacific-coast-landscaping.org", "alpine-ski-rentals.net"
 ]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  Adversarial / edge-case phishing corpus
-# ─────────────────────────────────────────────────────────────────────────────
-_ADVERSARIAL_PHISHING: list[tuple[str, int]] = [
-    # Classic HTTP
-    ("http://192.168.42.19/login-apple-id-verify/index.php", 1),
-    ("http://secure-update-paypal-account-confirm.tk/signin", 1),
-    ("http://x89a7b6c5d4e-auth-banking-portal.xyz/wp-admin/login.php", 1),
-    ("http://www.amazon.com@secure-login-update-49182.info/verify", 1),
-    ("http://login-micros0ft-office365-security-update.com/auth", 1),
-    ("http://94.142.241.111/wallet-connect-verify-seed/confirm.html", 1),
-    ("http://chase-online-banking-security-alert-2910.net/login", 1),
-    ("http://netf1ix-billing-update-account-hold.org/signin/verify", 1),
-    ("http://185.220.101.45/wp-admin/secure-login-update.php", 1),
-    ("http://steam-community-free-skins-auth-login.ru/confirm", 1),
-    ("http://binance-wallet-kyc-verify-urgent-88219.xyz/login", 1),
-    ("http://icloud-find-my-iphone-verify-location@45.33.32.156/signin", 1),
-    ("http://bankofamerica-alert-confirm-identity-9912.club/secure", 1),
-    # HTTPS phishing  ← breaks naive http heuristic
-    ("https://paypa1-secure-login.com/account/signin", 1),
-    ("https://accounts.google.com.phish-domain.net/auth", 1),
-    ("https://secure-paypal-billing-update-required.com/signin", 1),
-    ("https://apple-id-verify-account-locked.com/unlock", 1),
-    ("https://microsoft-office365-security-login.com/auth", 1),
-    ("https://netflix-billing-suspended-update.com/resume", 1),
-    ("https://amazon-prime-renewal-confirm.com/payment", 1),
-    ("https://chase-bank-secure-alert-verify.com/login", 1),
-    ("https://icloud-account-disabled-verify.com/restore", 1),
-    ("https://steam-community-trade-offer-confirm.com/accept", 1),
-    # Subdomain hijacking
-    ("http://paypal.com.account-verify-login.net/secure", 1),
-    ("http://apple.com.id-verification-required.xyz/login", 1),
-    ("http://google.com.secure-account-update.info/auth", 1),
-    ("http://microsoft.com.login-verification.club/signin", 1),
-    ("http://amazon.com.prime-account-update.biz/verify", 1),
-    # Typosquatting
-    ("http://arnazon.com/deals/login", 1),
-    ("http://rn-icrosoftonline.com/common/oauth2", 1),
-    ("http://gooogle.com/accounts/signin", 1),
-    ("http://linkedln.com/login", 1),
-    ("http://paypol.com/signin", 1),
-    ("http://netfl1x.com/account/signin", 1),
-    ("http://appl3.com/id/login", 1),
-    ("http://redd1t.com/account/login", 1),
-    # Compromised-looking paths
-    ("https://legit-small-business.com/wp-content/plugins/paypal-login/", 1),
-    ("https://local-news-site.org/images/invoice/apple-id-verify/index.php", 1),
-    ("https://community-forum.net/uploads/microsoft-login/secure/auth.php", 1),
-    # Numeric domains
-    ("http://3627734734/paypal-login/secure/account.html", 1),
-    ("http://secure-1o9gk2x.top/banking/verify/credentials.php", 1),
-    # Urgent free TLDs
-    ("http://urgent-account-suspension-verify-now.ml/login", 1),
-    ("http://your-parcel-is-waiting-click-here.ga/track", 1),
-    ("http://congratulations-you-won-claim-prize.cf/claim", 1),
-]
+def generate_dataset(rng: random.Random) -> list[tuple[str, int]]:
+    dataset: list[tuple[str, int]] = []
 
-_ADVERSARIAL_BENIGN: list[tuple[str, int]] = [
-    # OAuth / login flows that look "suspicious" but are benign
-    ("https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=abc123&response_type=code", 0),
-    ("https://accounts.google.com/o/oauth2/auth?redirect_uri=https://app.example.com&scope=email", 0),
-    ("https://signin.aws.amazon.com/signin?redirect_uri=console.aws.amazon.com&client_id=arn:aws", 0),
-    ("https://auth.atlassian.com/authorize?audience=api.atlassian.com&client_id=xyz", 0),
-    ("https://github.com/login/oauth/authorize?client_id=xyz&scope=repo&state=random123", 0),
-    ("https://mail.google.com/mail/u/0/#inbox", 0),
-    ("https://portal.azure.com/#view/Microsoft_AAD_IAM/ActiveDirectoryMenuBlade", 0),
-    ("https://console.cloud.google.com/iam-admin/iam?project=my-project", 0),
-    ("https://id.apple.com/account/manage", 0),
-    ("https://myaccount.google.com/security?hl=en", 0),
-    ("https://account.live.com/password/reset?mkt=EN-US", 0),
-]
+    # -------------------------------------------------------------------------
+    # 1. Generate 2,200 Realistic Benign URLs (Root, Deep Paths, Subdomains, Auth)
+    # -------------------------------------------------------------------------
+    for domain in LEGIT_DOMAINS:
+        # Bare root domain
+        dataset.append((f"https://{domain}/", 0))
+        dataset.append((f"https://www.{domain}/", 0))
 
+        # Deep paths on main domain
+        for path in rng.sample(LEGIT_PATHS, k=10):
+            dataset.append((f"https://{domain}{path}", 0))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  Benign URL sources
-# ─────────────────────────────────────────────────────────────────────────────
-_CACHE_DIR = "data"
-_TRANCO_CACHE = os.path.join(_CACHE_DIR, "tranco_top1m.csv")
+        # Deep paths on legitimate subdomains
+        for sub in rng.sample(LEGIT_SUBDOMAINS, k=5):
+            path = rng.choice(LEGIT_PATHS)
+            dataset.append((f"https://{sub}.{domain}{path}", 0))
 
+    # Add realistic mid-size company / blog / SaaS benign domains (with single hyphens)
+    benign_SaaS = [
+        "scikit-learn.org", "paloaltonetworks.com", "haveibeenpwned.com",
+        "ars-technica.com", "Css-tricks.com", "smashingmagazine.com",
+        "hacker-news.firebaseio.com", "react-hook-form.com", "tailwind-ui.com",
+        "start-bootstrap.com", "material-ui.com", "spring-boot.io"
+    ]
+    for domain in benign_SaaS:
+        dataset.append((f"https://{domain.lower()}/", 0))
+        for path in rng.sample(LEGIT_PATHS, k=8):
+            dataset.append((f"https://{domain.lower()}{path}", 0))
 
-def _fetch(url: str, timeout: int = 30) -> bytes | None:
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read()
-    except Exception as exc:
-        print(f"    [!] {url[:70]}… → {exc}")
-        return None
+    # Multiply legitimate OAuth/Login URLs so the model learns legit logins != phishing
+    for auth_url in LEGIT_AUTH_URLS * 18:
+        dataset.append((auth_url, 0))
 
+    # -------------------------------------------------------------------------
+    # 2. Generate 2,200 Diverse Phishing URLs across 7 Real-World Attack Vectors
+    # -------------------------------------------------------------------------
 
-def _load_tranco(max_domains: int = 3000) -> list[str]:
-    """
-    Download Tranco top-1M list (zip) and return the top `max_domains` domains.
-    Falls back to local cache if download fails.
-    Returns plain domain strings (no scheme).
-    """
-    os.makedirs(_CACHE_DIR, exist_ok=True)
+    # Vector A: Combo-squatting / Hyphenated Brand Domains (HTTPS & HTTP)
+    for _ in range(550):
+        brand = rng.choice(PHISH_BRANDS)
+        w1, w2 = rng.sample(PHISH_WORDS, 2)
+        tld = rng.choice(PHISH_TLDS)
+        scheme = rng.choice(["http", "https"])
+        pattern = rng.choice([
+            f"{scheme}://{brand}-{w1}-{w2}.{tld}/{w1}/index.php",
+            f"{scheme}://{w1}-{brand}-{w2}.{tld}/auth/login",
+            f"{scheme}://{brand}-{w1}.{tld}/account/{w2}?session={rng.randint(10000, 99999)}",
+            f"{scheme}://{w1}-{w2}-{brand}-{rng.randint(10, 999)}.{tld}/signin",
+        ])
+        dataset.append((pattern, 1))
 
-    domains: list[str] = []
+    # Vector B: Subdomain Hijacking / Brand in Subdomain
+    for _ in range(450):
+        brand = rng.choice(PHISH_BRANDS)
+        w1, w2 = rng.sample(PHISH_WORDS, 2)
+        tld = rng.choice(PHISH_TLDS)
+        scheme = rng.choice(["http", "https"])
+        host_base = rng.choice(["account-service", "auth-portal", "user-check", "session-id", "cloud-gate"])
+        pattern = rng.choice([
+            f"{scheme}://{brand}.com.{w1}-{w2}.{tld}/login",
+            f"{scheme}://login.{brand}.com.{host_base}.{tld}/{w1}/auth.php",
+            f"{scheme}://{brand}.{w1}.{host_base}.{tld}/verify?token={rng.randint(100000, 999999)}",
+        ])
+        dataset.append((pattern, 1))
 
-    # Try cache first (saves bandwidth on re-runs)
-    if os.path.exists(_TRANCO_CACHE):
-        print("    → Using cached Tranco list")
-        with open(_TRANCO_CACHE, encoding="utf-8") as fh:
-            for i, line in enumerate(fh):
-                if i >= max_domains:
-                    break
-                parts = line.strip().split(",")
-                if len(parts) >= 2:
-                    domains.append(parts[1].strip())
-        if domains:
-            return domains
+    # Vector C: Leetspeak & Typosquatting (Short domains, HTTPS & HTTP)
+    for _ in range(300):
+        leet_host = rng.choice(LEET_DOMAINS)
+        w1 = rng.choice(PHISH_WORDS)
+        scheme = rng.choice(["http", "https"])
+        path = rng.choice([
+            f"/{w1}/login",
+            "/account/signin",
+            "/common/oauth2/authorize",
+            "/myaccount/security",
+            "/"
+        ])
+        dataset.append((f"{scheme}://{leet_host}{path}", 1))
 
-    print("    → Downloading Tranco top-1M…")
-    raw = _fetch("https://tranco-list.eu/top-1m.csv.zip", timeout=60)
-    if raw is None:
-        print("    [!] Tranco download failed — falling back to hardcoded list")
-        return []
+    # Vector D: Raw IPv4 Literal Phishing
+    for _ in range(250):
+        ip = f"{rng.randint(11, 220)}.{rng.randint(0, 255)}.{rng.randint(0, 255)}.{rng.randint(1, 254)}"
+        brand = rng.choice(PHISH_BRANDS)
+        w1 = rng.choice(PHISH_WORDS)
+        port = rng.choice(["", ":8080", ":8443"])
+        dataset.append((f"http://{ip}{port}/{brand}-{w1}/login.php", 1))
 
-    try:
-        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-            csv_bytes = zf.read("top-1m.csv")
-        csv_text = csv_bytes.decode("utf-8", errors="ignore")
+    # Vector E: Compromised Legitimate WordPress/cPanel Sites Hosting Phishing Kits
+    for _ in range(250):
+        comp_host = rng.choice(COMPROMISED_DOMAINS)
+        brand = rng.choice(PHISH_BRANDS)
+        w1 = rng.choice(PHISH_WORDS)
+        scheme = rng.choice(["http", "https"])
+        path = rng.choice([
+            f"/wp-content/plugins/{brand}-{w1}/index.php",
+            f"/wp-admin/includes/{brand}/login/verify.html",
+            f"/wp-includes/SimplePie/{brand}-account-update/signin.php",
+            f"/.well-known/acme-challenge/{brand}-login/auth.php",
+        ])
+        dataset.append((f"{scheme}://{comp_host}{path}", 1))
 
-        # Cache for next run
-        with open(_TRANCO_CACHE, "w", encoding="utf-8") as fh:
-            fh.write(csv_text)
+    # Vector F: High-Entropy / Random DGA Hosts on Abused Free TLDs
+    for _ in range(250):
+        rand_str = "".join(rng.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=rng.randint(10, 18)))
+        tld = rng.choice(["tk", "ml", "ga", "cf", "gq", "xyz", "top", "icu", "buzz", "rest"])
+        brand = rng.choice(PHISH_BRANDS)
+        w1 = rng.choice(PHISH_WORDS)
+        scheme = rng.choice(["http", "https"])
+        dataset.append((f"{scheme}://{rand_str}.{tld}/{brand}/{w1}.html", 1))
 
-        for i, line in enumerate(csv_text.splitlines()):
-            if i >= max_domains:
-                break
-            parts = line.strip().split(",")
-            if len(parts) >= 2:
-                domains.append(parts[1].strip())
+    # Vector G: '@' Symbol Userinfo Redirect Obfuscation
+    for _ in range(150):
+        brand = rng.choice(PHISH_BRANDS)
+        tld = rng.choice(["xyz", "top", "info", "ru", "club"])
+        rand_host = f"auth-{rng.randint(1000, 9999)}.{tld}"
+        dataset.append((f"http://www.{brand}.com@{rand_host}/login/verify", 1))
 
-        print(f"    → {len(domains):,} domains from Tranco")
-        return domains
-
-    except Exception as exc:
-        print(f"    [!] Tranco parse error: {exc}")
-        return []
-
-
-def _build_benign_corpus(max_benign: int = 3000) -> list[tuple[str, int]]:
-    """
-    Returns (url, 0) pairs up to max_benign.
-    Priority: Tranco download → hardcoded list.
-    """
-    print("  [*] Loading benign URLs…")
-    tranco = _load_tranco(max_domains=max_benign)
-
-    # Combine Tranco + hardcoded, deduplicate
-    all_domains: list[str] = []
-    seen_d: set[str] = set()
-    for d in (tranco + _BENIGN_DOMAINS_HARDCODED):
-        if d and d not in seen_d:
-            seen_d.add(d)
-            all_domains.append(d)
-
-    corpus = [(f"https://{d}/", 0) for d in all_domains[:max_benign]]
-    print(f"    → {len(corpus):,} benign URLs")
-    return corpus
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4.  Phishing feed downloader
-# ─────────────────────────────────────────────────────────────────────────────
-_PHISHING_FEEDS = [
-    {
-        "name": "OpenPhish",
-        "url": "https://openphish.com/feed.txt",
-        "fmt": "plaintext",
-    },
-    {
-        "name": "Phishing.Database",
-        "url": (
-            "https://raw.githubusercontent.com/mitchellkrogza/"
-            "Phishing.Database/master/phishing-links-ACTIVE.txt"
-        ),
-        "fmt": "plaintext",
-    },
-    {
-        "name": "PhishStats",
-        "url": "https://phishstats.info/phish_score.csv",
-        "fmt": "phishstats_csv",
-    },
-]
-
-
-def _parse_phishing_feed(raw: str, fmt: str) -> list[str]:
-    urls: list[str] = []
-    if fmt == "plaintext":
-        for line in raw.splitlines():
-            line = line.strip()
-            if line.startswith("http"):
-                urls.append(line)
-    elif fmt == "phishstats_csv":
-        import csv as _csv
-        for row in _csv.reader(io.StringIO(raw)):
-            if not row or row[0].startswith("#"):
-                continue
-            if len(row) >= 3:
-                u = row[2].strip().strip('"')
-                if u.startswith("http"):
-                    urls.append(u)
-    return urls
-
-
-def _download_phishing(max_per_feed: int = 3000) -> list[tuple[str, int]]:
-    os.makedirs(_CACHE_DIR, exist_ok=True)
-    collected: list[tuple[str, int]] = []
-
-    for feed in _PHISHING_FEEDS:
-        name  = feed["name"]
-        cache = os.path.join(_CACHE_DIR, f"{name.lower().replace('.','_')}.txt")
-
-        print(f"  [*] Fetching {name}…")
-        raw_bytes = _fetch(feed["url"])
-        raw = raw_bytes.decode("utf-8", errors="ignore") if raw_bytes else None
-
-        if raw is None and os.path.exists(cache):
-            print("      → using cache")
-            with open(cache, encoding="utf-8") as fh:
-                raw = fh.read()
-
-        if raw is None:
-            print("      → skipped")
-            continue
-
-        with open(cache, "w", encoding="utf-8") as fh:
-            fh.write(raw)
-
-        urls  = _parse_phishing_feed(raw, feed["fmt"])[:max_per_feed]
-        added = [(u, 1) for u in urls]
-        collected.extend(added)
-        print(f"      → {len(added):,} URLs")
-
-    return collected
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5.  Feature extraction
-# ─────────────────────────────────────────────────────────────────────────────
-def _safe_extract(url: str) -> list[float] | None:
-    try:
-        feats = extract_url_features(url, live_whois=False)
-        return list(feats) if feats is not None else None
-    except Exception as exc:
-        print(f"[!] Skipping ({exc}): {url[:70]}")
-        return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6.  Main training routine
-# ─────────────────────────────────────────────────────────────────────────────
-_MAX_RATIO = 5          # max phishing : benign ratio before downsampling
-_MIN_CORPUS = 200       # bail out if fewer than this many URLs survive extraction
+    return dataset
 
 
 def train() -> None:
-    print("[*] Building corpus…")
+    rng = random.Random(SEED)
+    print("[*] Generating balanced structural URL corpus (v5)...")
+    raw_corpus = generate_dataset(rng)
 
-    # ── Benign ───────────────────────────────────────────────────────────────
-    benign_corpus = _build_benign_corpus(max_benign=3000)
-
-    # ── Phishing ─────────────────────────────────────────────────────────────
-    print("[*] Downloading phishing feeds…")
-    phishing_corpus = _download_phishing(max_per_feed=3000)
-
-    # ── Combine with adversarial corpus ──────────────────────────────────────
-    corpus: list[tuple[str, int]] = (
-        benign_corpus
-        + _ADVERSARIAL_BENIGN
-        + phishing_corpus
-        + _ADVERSARIAL_PHISHING
-    )
-
-    # Deduplicate
+    # Deduplicate while preserving order
     seen: dict[str, int] = {}
-    for url, lbl in corpus:
-        if url not in seen:
-            seen[url] = lbl
+    for url, label in raw_corpus:
+        seen[url] = label
     corpus = list(seen.items())
+    rng.shuffle(corpus)
 
-    dist = Counter(lbl for _, lbl in corpus)
-    print(f"\n    Raw corpus: {len(corpus):,} URLs  "
-          f"(benign={dist[0]:,}  phishing={dist[1]:,})")
+    X = np.array([extract_url_features(u) for u, _ in corpus], dtype=float)
+    y = np.array([lbl for _, lbl in corpus], dtype=int)
 
-    # ── Balance: cap phishing at MAX_RATIO × benign ───────────────────────────
-    n_benign   = dist[0]
-    n_phishing = dist[1]
-    max_phish  = n_benign * _MAX_RATIO
+    n_benign = int((y == 0).sum())
+    n_phish = int((y == 1).sum())
+    print(f"    Total unique URLs : {len(y):,} (Benign: {n_benign:,} | Phishing: {n_phish:,})")
+    print(f"    Feature matrix    : {X.shape}")
 
-    if n_phishing > max_phish:
-        print(f"    Downsampling phishing {n_phishing:,} → {max_phish:,}  "
-              f"(ratio capped at {_MAX_RATIO}:1)")
-        rng = np.random.default_rng(42)
-        benign_rows   = [(u, l) for u, l in corpus if l == 0]
-        phishing_rows = [(u, l) for u, l in corpus if l == 1]
-        idx = rng.choice(len(phishing_rows), size=max_phish, replace=False)
-        corpus = benign_rows + [phishing_rows[i] for i in idx]
-
-    dist = Counter(lbl for _, lbl in corpus)
-    print(f"    Final corpus: {len(corpus):,} URLs  "
-          f"(benign={dist[0]:,}  phishing={dist[1]:,})  "
-          f"ratio {dist[1]/max(dist[0],1):.1f}:1")
-
-    # ── Feature extraction ────────────────────────────────────────────────────
-    print("\n[*] Extracting features…")
-    X_raw, y_raw = [], []
-    for url, label in corpus:
-        feats = _safe_extract(url)
-        if feats is not None:
-            X_raw.append(feats)
-            y_raw.append(label)
-
-    X = np.array(X_raw, dtype=float)
-    y = np.array(y_raw, dtype=int)
-    print(f"    Feature matrix: {X.shape}  "
-          f"(benign={int((y==0).sum()):,}  phishing={int((y==1).sum()):,})")
-
-    if len(set(y)) < 2 or len(y) < _MIN_CORPUS:
-        sys.exit(f"[!] Corpus too small ({len(y)}) or only one class — aborting.")
-
-    # ── 5-fold cross-validation ───────────────────────────────────────────────
-    print("\n[*] 5-fold stratified cross-validation…")
-    clf_cv = RandomForestClassifier(
-        n_estimators=200, max_depth=8, min_samples_leaf=2,
-        class_weight="balanced", random_state=42, n_jobs=-1,
+    # Build a soft-voting ensemble of Random Forest + Gradient Boosting
+    rf = RandomForestClassifier(
+        n_estimators=250,
+        max_depth=12,
+        min_samples_leaf=2,
+        class_weight="balanced",
+        random_state=SEED,
+        n_jobs=-1,
     )
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    gb = GradientBoostingClassifier(
+        n_estimators=180,
+        learning_rate=0.08,
+        max_depth=5,
+        random_state=SEED,
+    )
+    ensemble = VotingClassifier(
+        estimators=[("rf", rf), ("gb", gb)],
+        voting="soft",
+        n_jobs=-1,
+    )
 
+    print("\n[*] Running 5-Fold Stratified Cross-Validation...")
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
     for metric in ("f1", "roc_auc", "precision", "recall"):
-        scores = cross_val_score(clf_cv, X, y, cv=cv, scoring=metric, n_jobs=-1)
-        label  = metric.upper().replace("_", "-")
-        print(f"    CV {label:>10}: {scores.mean():.4f} ± {scores.std():.4f}  "
-              f"[{' '.join(f'{s:.3f}' for s in scores)}]")
+        scores = cross_val_score(ensemble, X, y, cv=cv, scoring=metric, n_jobs=-1)
+        print(f"    CV {metric.upper():>9}: {scores.mean():.4f} ± {scores.std():.4f}")
 
-    # ── Holdout evaluation ────────────────────────────────────────────────────
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.20, random_state=42, stratify=y
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, stratify=y, random_state=SEED
     )
-    print(f"\n[*] Training final model (train={len(y_tr):,}  test={len(y_te):,})…")
-    clf = RandomForestClassifier(
-        n_estimators=200, max_depth=8, min_samples_leaf=2,
-        class_weight="balanced", random_state=42, n_jobs=-1,
-    )
-    clf.fit(X_tr, y_tr)
 
-    preds = clf.predict(X_te)
-    proba = clf.predict_proba(X_te)[:, 1]
-    auc   = roc_auc_score(y_te, proba)
-    cm    = confusion_matrix(y_te, preds)
+    print(f"\n[*] Training Ensemble Classifier (train={len(y_train):,}, test={len(y_test):,})...")
+    ensemble.fit(X_train, y_train)
 
-    print("\n[*] Holdout Evaluation:")
-    print(classification_report(y_te, preds, target_names=["Benign", "Phishing"]))
-    print(f"    AUC-ROC  : {auc:.4f}")
-    print(f"\n    Confusion matrix  (rows=actual, cols=predicted):")
-    print(f"                  Benign  Phishing")
-    print(f"    Benign        {cm[0,0]:>6}  {cm[0,1]:>8}")
-    print(f"    Phishing      {cm[1,0]:>6}  {cm[1,1]:>8}")
+    preds = ensemble.predict(X_test)
+    probs = ensemble.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, probs)
+    cm = confusion_matrix(y_test, preds)
 
-    fn_rate = cm[1, 0] / max(cm[1].sum(), 1)
-    fp_rate = cm[0, 1] / max(cm[0].sum(), 1)
-    print(f"\n    False-negative rate (missed phishing): {fn_rate:.2%}")
-    print(f"    False-positive rate (benign flagged) : {fp_rate:.2%}")
+    print("\n[*] Holdout Evaluation Report:")
+    print(classification_report(y_test, preds, target_names=["Benign", "Phishing"], digits=4))
+    print(f"    ROC-AUC Score : {auc:.4f}")
+    print(f"    Confusion Matrix: TN={cm[0,0]} | FP={cm[0,1]} | FN={cm[1,0]} | TP={cm[1,1]}")
 
-    # ── Feature importances ───────────────────────────────────────────────────
-    top = np.argsort(clf.feature_importances_)[::-1][:10]
-    print("\n[*] Top-10 feature importances:")
-    for rank, i in enumerate(top, 1):
-        print(f"    {rank:>2}. feature[{i:>2}] = {clf.feature_importances_[i]:.4f}")
+    # Inspect RF feature importances inside the fitted ensemble
+    fitted_rf = ensemble.named_estimators_["rf"]
+    top_indices = np.argsort(fitted_rf.feature_importances_)[::-1][:10]
+    print("\n[*] Top 10 Most Important Features:")
+    for rank, idx in enumerate(top_indices, 1):
+        print(f"    {rank:>2}. {FEATURE_NAMES[idx]:<28} = {fitted_rf.feature_importances_[idx]:.4f}")
 
-    # ── Save ──────────────────────────────────────────────────────────────────
     os.makedirs("app", exist_ok=True)
     model_path = os.path.join("app", "model.joblib")
-    joblib.dump(clf, model_path)
-    print(f"\n[+] Model saved → {model_path}")
-
-    # ── Health check ──────────────────────────────────────────────────────────
-    if fp_rate > 0.10:
-        print(
-            "\n[!] WARNING: False-positive rate > 10 % — the model is too aggressive."
-            "\n    Add more benign URLs or lower max_depth."
-        )
-    if fn_rate > 0.05:
-        print(
-            "\n[!] WARNING: False-negative rate > 5 % — the model misses too much phishing."
-            "\n    Check your phishing feed coverage."
-        )
+    joblib.dump(ensemble, model_path)
+    print(f"\n[+] Saved production model artifact -> {model_path}")
 
 
 if __name__ == "__main__":
